@@ -9,6 +9,7 @@ require (
 	github.com/go-sql-driver/mysql v1.9.2
 	github.com/gorilla/sessions v1.4.0
 	github.com/jmoiron/sqlx v1.4.0
+	golang.org/x/sync v0.6.0
 )
 
 require (

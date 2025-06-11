@@ -25,6 +25,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/jmoiron/sqlx"
+	"golang.org/x/sync/errgroup"
 )
 
 var (
@@ -71,6 +72,18 @@ type Comment struct {
 	Comment   string    `db:"comment"`
 	CreatedAt time.Time `db:"created_at"`
 	User      User
+}
+
+// Async processing helpers
+type PostResult struct {
+	Post Post
+	Err  error
+}
+
+type CommentResult struct {
+	Comments []Comment
+	Count   int
+	Err     error
 }
 
 func init() {
@@ -180,52 +193,28 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	var posts []Post
-
-	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
-			return nil, err
+	postChan := make([]chan PostResult, len(results))
+	
+	// Start async processing for each post
+	for i := range results {
+		postChan[i] = getPostDataAsync(&results[i], csrfToken, allComments)
+	}
+	
+	// Collect results
+	for _, ch := range postChan {
+		result := <-ch
+		if result.Err != nil {
+			return nil, result.Err
 		}
-
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
-		}
-
-		p.Comments = comments
-
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
-		}
-
-		p.CSRFToken = csrfToken
-
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
+		
+		if result.Post.User.DelFlg == 0 {
+			posts = append(posts, result.Post)
 		}
 		if len(posts) >= postsPerPage {
 			break
 		}
 	}
-
+	
 	return posts, nil
 }
 
@@ -333,39 +322,43 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-
+	
 	accountName, password := r.FormValue("account_name"), r.FormValue("password")
-
+	
 	validated := validateUser(accountName, password)
 	if !validated {
 		session := getSession(r)
 		session.Values["notice"] = "アカウント名は3文字以上、パスワードは6文字以上である必要があります"
 		session.Save(r, w)
-
+		
 		http.Redirect(w, r, "/register", http.StatusFound)
 		return
 	}
-
+	
 	exists := 0
-	// ユーザーが存在しない場合はエラーになるのでエラーチェックはしない
-	db.Get(&exists, "SELECT 1 FROM users WHERE `account_name` = ?", accountName)
-
-	if exists == 1 {
+	// Start password hash calculation while checking user existence
+	passhashChan := calculatePasshashAsync(accountName, password)
+	
+	err := db.Get(&exists, "SELECT 1 FROM users WHERE `account_name` = ?", accountName)
+	if err == nil && exists == 1 {
 		session := getSession(r)
 		session.Values["notice"] = "アカウント名がすでに使われています"
 		session.Save(r, w)
-
+		
 		http.Redirect(w, r, "/register", http.StatusFound)
 		return
 	}
-
+	
+	// Wait for password hash
+	passhash := <-passhashChan
+	
 	query := "INSERT INTO `users` (`account_name`, `passhash`) VALUES (?,?)"
-	result, err := db.Exec(query, accountName, calculatePasshash(accountName, password))
+	result, err := db.Exec(query, accountName, passhash)
 	if err != nil {
 		log.Print(err)
 		return
 	}
-
+	
 	session := getSession(r)
 	uid, err := result.LastInsertId()
 	if err != nil {
@@ -375,7 +368,7 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 	session.Values["user_id"] = uid
 	session.Values["csrf_token"] = secureRandomStr(16)
 	session.Save(r, w)
-
+	
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
@@ -772,29 +765,38 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-
+	
 	if me.Authority == 0 {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
-
+	
 	if r.FormValue("csrf_token") != getCSRFToken(r) {
 		w.WriteHeader(http.StatusUnprocessableEntity)
 		return
 	}
-
-	query := "UPDATE `users` SET `del_flg` = ? WHERE `id` = ?"
-
+	
 	err := r.ParseForm()
 	if err != nil {
 		log.Print(err)
 		return
 	}
-
+	
+	// Process bans in parallel
+	eg := errgroup.Group{}
 	for _, id := range r.Form["uid[]"] {
-		db.Exec(query, 1, id)
+		id := id // capture loop variable
+		eg.Go(func() error {
+			_, err := db.Exec("UPDATE `users` SET `del_flg` = ? WHERE `id` = ?", 1, id)
+			return err
+		})
 	}
-
+	
+	if err := eg.Wait(); err != nil {
+		log.Print(err)
+		return
+	}
+	
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
 }
 
@@ -866,6 +868,102 @@ func serveStaticFile(w http.ResponseWriter, r *http.Request) {
 	
 	// Fallback to standard file server
 	http.FileServer(http.Dir("../public")).ServeHTTP(w, r)
+}
+
+// Async processing helpers
+func getPostDataAsync(p *Post, csrfToken string, allComments bool) chan PostResult {
+	resultChan := make(chan PostResult, 1)
+	
+	go func() {
+		defer close(resultChan)
+		
+		// Get comment count and comments in parallel
+		commentChan := getCommentsAsync(p.ID, allComments)
+		
+		// Get user info while waiting for comments
+		err := db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
+		if err != nil {
+			resultChan <- PostResult{Err: err}
+			return
+		}
+		
+		// Wait for comment results
+		commentResult := <-commentChan
+		if commentResult.Err != nil {
+			resultChan <- PostResult{Err: commentResult.Err}
+			return
+		}
+		
+		p.Comments = commentResult.Comments
+		p.CommentCount = commentResult.Count
+		p.CSRFToken = csrfToken
+		
+		resultChan <- PostResult{Post: *p}
+	}()
+	
+	return resultChan
+}
+
+func getCommentsAsync(postID int, allComments bool) chan CommentResult {
+	resultChan := make(chan CommentResult, 1)
+	
+	go func() {
+		defer close(resultChan)
+		
+		var count int
+		err := db.Get(&count, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", postID)
+		if err != nil {
+			resultChan <- CommentResult{Err: err}
+			return
+		}
+		
+		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
+		if !allComments {
+			query += " LIMIT 3"
+		}
+		
+		var comments []Comment
+		err = db.Select(&comments, query, postID)
+		if err != nil {
+			resultChan <- CommentResult{Err: err}
+			return
+		}
+		
+		// Get user info for each comment in parallel
+		eg := errgroup.Group{}
+		for i := range comments {
+			i := i // capture loop variable
+			eg.Go(func() error {
+				return db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
+			})
+		}
+		
+		if err := eg.Wait(); err != nil {
+			resultChan <- CommentResult{Err: err}
+			return
+		}
+		
+		// Reverse comments order
+		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+			comments[i], comments[j] = comments[j], comments[i]
+		}
+		
+		resultChan <- CommentResult{Comments: comments, Count: count}
+	}()
+	
+	return resultChan
+}
+
+// Async password hashing
+func calculatePasshashAsync(accountName, password string) chan string {
+	resultChan := make(chan string, 1)
+	
+	go func() {
+		defer close(resultChan)
+		resultChan <- digest(password + ":" + calculateSalt(accountName))
+	}()
+	
+	return resultChan
 }
 
 func main() {
