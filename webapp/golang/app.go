@@ -51,7 +51,6 @@ type Post struct {
 	Body         string    `db:"body"`
 	Mime         string    `db:"mime"`
 	CreatedAt    time.Time `db:"created_at"`
-	ImagePath    string    `db:"image_path"`
 	CommentCount int
 	Comments     []Comment
 	User         User
@@ -90,32 +89,6 @@ func dbInitialize() {
 		db.Exec(sql)
 	}
 
-	// Add image_path column if it doesn't exist (ignore errors if already exists)
-	db.Exec("ALTER TABLE `posts` ADD COLUMN `image_path` VARCHAR(255) DEFAULT NULL")
-
-	// Migrate existing image data from BLOB to filesystem
-	var posts []Post
-	err := db.Select(&posts, "SELECT id, mime, imgdata FROM posts WHERE imgdata IS NOT NULL AND (image_path IS NULL OR image_path = '')")
-	if err == nil {
-		for _, post := range posts {
-			if len(post.Imgdata) > 0 {
-				ext := getImageExt(post.Mime)
-				if ext != "" {
-					imagePath := fmt.Sprintf("/images/%d%s", post.ID, ext)
-					fullPath := "./public" + imagePath
-					
-					// Ensure directory exists
-					os.MkdirAll("./public/images", 0755)
-					
-					err := os.WriteFile(fullPath, post.Imgdata, 0644)
-					if err == nil {
-						// Update the database with the image path and clear the blob data
-						db.Exec("UPDATE posts SET image_path = ?, imgdata = NULL WHERE id = ?", imagePath, post.ID)
-					}
-				}
-			}
-		}
-	}
 }
 
 func tryLogin(accountName, password string) *User {
@@ -345,12 +318,6 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 }
 
 func imageURL(p Post) string {
-	// If we have an image path stored, use it directly
-	if p.ImagePath != "" {
-		return p.ImagePath
-	}
-	
-	// Fallback to old URL pattern for backward compatibility
 	ext := ""
 	if p.Mime == "image/jpeg" {
 		ext = ".jpg"
@@ -797,6 +764,9 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	imagePath := fmt.Sprintf("/images/%d%s", pid, ext)
 	fullPath := "./public" + imagePath
 	
+	// Ensure directory exists
+	os.MkdirAll("./public/images", 0755)
+	
 	err = os.WriteFile(fullPath, filedata, 0644)
 	if err != nil {
 		log.Print(err)
@@ -804,21 +774,6 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		db.Exec("DELETE FROM `posts` WHERE `id` = ?", pid)
 		session := getSession(r)
 		session.Values["notice"] = "画像の保存に失敗しました"
-		session.Save(r, w)
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
-	}
-
-	// Update the post with the image path
-	_, err = db.Exec("UPDATE `posts` SET `image_path` = ? WHERE `id` = ?", imagePath, pid)
-	if err != nil {
-		log.Print(err)
-		// Clean up the saved image file
-		os.Remove(fullPath)
-		// Rollback the post insertion
-		db.Exec("DELETE FROM `posts` WHERE `id` = ?", pid)
-		session := getSession(r)
-		session.Values["notice"] = "画像パスの更新に失敗しました"
 		session.Save(r, w)
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
@@ -855,19 +810,17 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", post.Mime)
 
-	// Try to serve from filesystem first (new method)
-	if post.ImagePath != "" {
-		fullPath := "./public" + post.ImagePath
-		imageData, err := os.ReadFile(fullPath)
-		if err == nil {
-			_, err = w.Write(imageData)
-			if err != nil {
-				log.Print(err)
-			}
-			return
+	// Try to serve from filesystem first
+	imageFileExt := getImageExt(post.Mime)
+	imagePath := fmt.Sprintf("/images/%d%s", post.ID, imageFileExt)
+	fullPath := "./public" + imagePath
+	imageData, err := os.ReadFile(fullPath)
+	if err == nil {
+		_, err = w.Write(imageData)
+		if err != nil {
+			log.Print(err)
 		}
-		// If file read fails, fall back to DB method
-		log.Printf("Failed to read image file %s: %v", fullPath, err)
+		return
 	}
 
 	// Fallback to DB method (for backward compatibility)
