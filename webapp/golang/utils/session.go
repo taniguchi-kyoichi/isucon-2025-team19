@@ -3,9 +3,11 @@ package utils
 import (
 	"net/http"
 
+	"github.com/catatsuy/private-isu/webapp/golang/cache"
 	"github.com/catatsuy/private-isu/webapp/golang/models"
 	"github.com/gorilla/sessions"
 	"github.com/jmoiron/sqlx"
+	"log"
 )
 
 var (
@@ -30,10 +32,26 @@ func GetSessionUser(r *http.Request) models.User {
 		return models.User{}
 	}
 
+	// Try to get from cache first
+	userID := uid.(int)
+	cachedUser, err := cache.GetUserFromCache(userID)
+	if err != nil {
+		// Log error but continue to get from DB
+		log.Printf("Failed to get user from cache: %v", err)
+	} else if cachedUser != nil {
+		return *cachedUser
+	}
+
+	// Cache miss or error, get from DB
 	u := models.User{}
-	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
+	err = db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", userID)
 	if err != nil {
 		return models.User{}
+	}
+
+	// Set cache for next time
+	if err := cache.SetUserCache(&u); err != nil {
+		log.Printf("Failed to set user cache: %v", err)
 	}
 
 	return u

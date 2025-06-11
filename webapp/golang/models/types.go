@@ -44,4 +44,9 @@ type CommentResult struct {
 	Comments []Comment
 	Count   int
 	Err     error
+}
+
+type Category struct {
+	ID   int    `db:"id" json:"id"`
+	Name string `db:"name" json:"name"`
 } 

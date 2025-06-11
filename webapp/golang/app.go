@@ -8,7 +8,9 @@ import (
 	"path"
 	"strconv"
 
+	"github.com/catatsuy/private-isu/webapp/golang/cache"
 	"github.com/catatsuy/private-isu/webapp/golang/handlers"
+	"github.com/catatsuy/private-isu/webapp/golang/middleware"
 	"github.com/catatsuy/private-isu/webapp/golang/utils"
 	"github.com/bradfitz/gomemcache/memcache"
 	gsm "github.com/bradleypeabody/gorilla-sessions-memcache"
@@ -37,6 +39,11 @@ func dbInitialize() {
 
 	for _, sql := range sqls {
 		db.Exec(sql)
+	}
+
+	// Clear all caches on initialization
+	if client := cache.GetClient(); client != nil {
+		client.FlushAll()
 	}
 }
 
@@ -82,14 +89,24 @@ func main() {
 	if memdAddr == "" {
 		memdAddr = "localhost:11211"
 	}
-	memcacheClient := memcache.New(memdAddr)
+
+	// Initialize cache
+	cache.Initialize(memdAddr)
+
+	memcacheClient := cache.GetClient()
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
 
 	// Initialize handlers and utils
 	handlers.InitHandlers(db, store)
 	utils.InitSession(db, store)
 
+	// Start metrics collector
+	go middleware.MetricsCollector()
+
 	r := chi.NewRouter()
+
+	// Add metrics middleware
+	r.Use(middleware.MetricsMiddleware)
 
 	// Routes
 	r.Get("/initialize", dbInitialize)

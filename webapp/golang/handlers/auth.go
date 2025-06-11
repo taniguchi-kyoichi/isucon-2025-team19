@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"regexp"
 
+	"github.com/catatsuy/private-isu/webapp/golang/cache"
+	"github.com/catatsuy/private-isu/webapp/golang/models"
+	"github.com/catatsuy/private-isu/webapp/golang/utils"
 	"github.com/gorilla/sessions"
 	"github.com/jmoiron/sqlx"
 )
@@ -25,9 +28,9 @@ func validateUser(accountName, password string) bool {
 }
 
 func GetLogin(w http.ResponseWriter, r *http.Request) {
-	me := GetSessionUser(r)
+	me := utils.GetSessionUser(r)
 
-	if IsLogin(me) {
+	if utils.IsLogin(me) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
@@ -36,13 +39,13 @@ func GetLogin(w http.ResponseWriter, r *http.Request) {
 		getTemplPath("layout.html"),
 		getTemplPath("login.html")),
 	).Execute(w, struct {
-		Me    User
+		Me    models.User
 		Flash string
-	}{me, GetFlash(w, r, "notice")})
+	}{me, utils.GetFlash(w, r, "notice")})
 }
 
 func PostLogin(w http.ResponseWriter, r *http.Request) {
-	if IsLogin(GetSessionUser(r)) {
+	if utils.IsLogin(utils.GetSessionUser(r)) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
@@ -50,14 +53,19 @@ func PostLogin(w http.ResponseWriter, r *http.Request) {
 	u := tryLogin(r.FormValue("account_name"), r.FormValue("password"))
 
 	if u != nil {
-		session := GetSession(r)
+		session := utils.GetSession(r)
 		session.Values["user_id"] = u.ID
-		session.Values["csrf_token"] = SecureRandomStr(16)
+		session.Values["csrf_token"] = utils.SecureRandomStr(16)
 		session.Save(r, w)
+
+		// Cache the user data
+		if err := cache.SetUserCache(u); err != nil {
+			log.Printf("Failed to set user cache on login: %v", err)
+		}
 
 		http.Redirect(w, r, "/", http.StatusFound)
 	} else {
-		session := GetSession(r)
+		session := utils.GetSession(r)
 		session.Values["notice"] = "アカウント名かパスワードが間違っています"
 		session.Save(r, w)
 
@@ -66,7 +74,7 @@ func PostLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func GetRegister(w http.ResponseWriter, r *http.Request) {
-	if IsLogin(GetSessionUser(r)) {
+	if utils.IsLogin(utils.GetSessionUser(r)) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
@@ -75,13 +83,13 @@ func GetRegister(w http.ResponseWriter, r *http.Request) {
 		getTemplPath("layout.html"),
 		getTemplPath("register.html")),
 	).Execute(w, struct {
-		Me    User
+		Me    models.User
 		Flash string
-	}{User{}, GetFlash(w, r, "notice")})
+	}{models.User{}, utils.GetFlash(w, r, "notice")})
 }
 
 func PostRegister(w http.ResponseWriter, r *http.Request) {
-	if IsLogin(GetSessionUser(r)) {
+	if utils.IsLogin(utils.GetSessionUser(r)) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
@@ -90,7 +98,7 @@ func PostRegister(w http.ResponseWriter, r *http.Request) {
 
 	validated := validateUser(accountName, password)
 	if !validated {
-		session := GetSession(r)
+		session := utils.GetSession(r)
 		session.Values["notice"] = "アカウント名は3文字以上、パスワードは6文字以上である必要があります"
 		session.Save(r, w)
 
@@ -101,7 +109,7 @@ func PostRegister(w http.ResponseWriter, r *http.Request) {
 	exists := 0
 	err := db.Get(&exists, "SELECT 1 FROM users WHERE `account_name` = ?", accountName)
 	if err == nil && exists == 1 {
-		session := GetSession(r)
+		session := utils.GetSession(r)
 		session.Values["notice"] = "アカウント名がすでに使われています"
 		session.Save(r, w)
 
@@ -110,27 +118,49 @@ func PostRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := "INSERT INTO `users` (`account_name`, `passhash`) VALUES (?,?)"
-	result, err := db.Exec(query, accountName, CalculatePasshash(accountName, password))
+	result, err := db.Exec(query, accountName, utils.CalculatePasshash(accountName, password))
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	session := GetSession(r)
+	session := utils.GetSession(r)
 	uid, err := result.LastInsertId()
 	if err != nil {
 		log.Print(err)
 		return
 	}
+
+	// Get the newly created user
+	newUser := models.User{}
+	err = db.Get(&newUser, "SELECT * FROM `users` WHERE `id` = ?", uid)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+
+	// Cache the new user
+	if err := cache.SetUserCache(&newUser); err != nil {
+		log.Printf("Failed to set user cache on register: %v", err)
+	}
+
 	session.Values["user_id"] = uid
-	session.Values["csrf_token"] = SecureRandomStr(16)
+	session.Values["csrf_token"] = utils.SecureRandomStr(16)
 	session.Save(r, w)
 
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 func GetLogout(w http.ResponseWriter, r *http.Request) {
-	session := GetSession(r)
+	session := utils.GetSession(r)
+	
+	// Delete user cache if logged in
+	if uid, ok := session.Values["user_id"]; ok && uid != nil {
+		if err := cache.DeleteUserCache(uid.(int)); err != nil {
+			log.Printf("Failed to delete user cache on logout: %v", err)
+		}
+	}
+
 	delete(session.Values, "user_id")
 	session.Options = &sessions.Options{MaxAge: -1}
 	session.Save(r, w)
