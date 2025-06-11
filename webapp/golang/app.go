@@ -5,15 +5,18 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
@@ -27,6 +30,10 @@ import (
 var (
 	db    *sqlx.DB
 	store *gsm.MemcacheStore
+
+	// Static file cache
+	staticCache = make(map[string][]byte)
+	staticCacheMutex sync.RWMutex
 )
 
 const (
@@ -791,6 +798,76 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
 }
 
+// Initialize static file cache
+func initStaticCache() error {
+	staticPaths := []string{
+		"../public/css",
+		"../public/js",
+		"../public/img",
+	}
+
+	for _, dir := range staticPaths {
+		err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
+				data, err := ioutil.ReadFile(path)
+				if err != nil {
+					return err
+				}
+				relativePath := strings.TrimPrefix(path, "../public")
+				staticCacheMutex.Lock()
+				staticCache[relativePath] = data
+				staticCacheMutex.Unlock()
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func serveStaticFile(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+	
+	// Try to serve from cache first
+	staticCacheMutex.RLock()
+	data, exists := staticCache[path]
+	staticCacheMutex.RUnlock()
+	
+	if exists {
+		// Set cache headers
+		w.Header().Set("Cache-Control", "public, max-age=2592000") // 30 days
+		w.Header().Set("Expires", time.Now().Add(30*24*time.Hour).Format(http.TimeFormat))
+		
+		// Determine content type
+		ext := filepath.Ext(path)
+		switch ext {
+		case ".css":
+			w.Header().Set("Content-Type", "text/css")
+		case ".js":
+			w.Header().Set("Content-Type", "application/javascript")
+		case ".jpg", ".jpeg":
+			w.Header().Set("Content-Type", "image/jpeg")
+		case ".png":
+			w.Header().Set("Content-Type", "image/png")
+		case ".gif":
+			w.Header().Set("Content-Type", "image/gif")
+		case ".ico":
+			w.Header().Set("Content-Type", "image/x-icon")
+		}
+		
+		w.Write(data)
+		return
+	}
+	
+	// Fallback to standard file server
+	http.FileServer(http.Dir("../public")).ServeHTTP(w, r)
+}
+
 func main() {
 	host := os.Getenv("ISUCONP_DB_HOST")
 	if host == "" {
@@ -829,7 +906,18 @@ func main() {
 	}
 	defer db.Close()
 
+	// Initialize static file cache
+	if err := initStaticCache(); err != nil {
+		log.Printf("Warning: Failed to initialize static cache: %v", err)
+	}
+
 	r := chi.NewRouter()
+
+	// Static file routes
+	r.Get("/css/*", serveStaticFile)
+	r.Get("/js/*", serveStaticFile)
+	r.Get("/img/*", serveStaticFile)
+	r.Get("/favicon.ico", serveStaticFile)
 
 	r.Get("/initialize", getInitialize)
 	r.Get("/login", getLogin)
