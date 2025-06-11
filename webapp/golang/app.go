@@ -171,52 +171,129 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 	}
 }
 
+// makePosts は投稿データを処理し、必要な関連データ（コメント数、コメント、ユーザー情報）を効率的に取得します
+// パフォーマンス最適化のため、N+1問題を解消し、バッチ処理を実装しています
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	var posts []Post
+	var err error
 
-	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
-			return nil, err
-		}
+	// 結果が0件の場合は早期リターン
+	if len(results) == 0 {
+		return posts, nil
+	}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
-		if err != nil {
-			return nil, err
-		}
+	// -----------------------------
+	// 1. 初期化とデータ構造の準備
+	// -----------------------------
+	// 投稿IDのスライスとインデックスマップを作成
+	// インデックスマップは後でO(1)のルックアップを可能にします
+	postIDs := make([]interface{}, len(results))
+	postIDToIndex := make(map[int]int)
+	for i, p := range results {
+		postIDs[i] = p.ID
+		postIDToIndex[p.ID] = i
+		results[i].CSRFToken = csrfToken
+	}
 
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
+	// SQLのIN句で使用するプレースホルダーを生成 (例: "?,?,?")
+	placeholder := strings.Repeat("?,", len(postIDs))
+	placeholder = placeholder[:len(placeholder)-1]
+
+	// -----------------------------
+	// 2. コメント数の一括取得
+	// -----------------------------
+	// 各投稿のコメント数を1回のクエリで取得
+	// 元のコードではループ内で毎回クエリを実行していました
+	type CommentCount struct {
+		PostID int `db:"post_id"`
+		Count  int `db:"count"`
+	}
+	commentCounts := []CommentCount{}
+	err = db.Select(&commentCounts, 
+		"SELECT post_id, COUNT(*) as count FROM comments WHERE post_id IN ("+placeholder+") GROUP BY post_id",
+		postIDs...)
+	if err != nil {
+		return nil, err
+	}
+	// 取得したコメント数を対応する投稿に設定
+	for _, cc := range commentCounts {
+		results[postIDToIndex[cc.PostID]].CommentCount = cc.Count
+	}
+
+	// -----------------------------
+	// 3. コメントとその投稿者情報の一括取得
+	// -----------------------------
+	// JOINを使用してコメントとユーザー情報を1回のクエリで取得
+	// allCommentsフラグに応じて取得件数を制限
+	query := "SELECT c.*, u.* FROM comments c " +
+		"JOIN users u ON c.user_id = u.id " +
+		"WHERE c.post_id IN (" + placeholder + ") "
+	if !allComments {
+		// 最新3件のコメントのみを取得
+		query += "AND c.id IN (SELECT id FROM (" +
+			"SELECT id FROM comments WHERE post_id IN (" + placeholder + ") " +
+			"ORDER BY created_at DESC LIMIT 3" +
+			") t)"
+	}
+	query += " ORDER BY c.post_id, c.created_at"
+
+	// コメントとユーザー情報を同時に取得するための構造体
+	type CommentJoinUser struct {
+		Comment
+		User User `db:"u"`
+	}
+	commentJoinUsers := []CommentJoinUser{}
+	args := append(postIDs, postIDs...) // プレースホルダーが2セット必要なため
+	err = db.Select(&commentJoinUsers, query, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	// 取得したコメントを対応する投稿に関連付け
+	for _, cju := range commentJoinUsers {
+		cju.Comment.User = cju.User
+		results[postIDToIndex[cju.PostID]].Comments = append(
+			results[postIDToIndex[cju.PostID]].Comments,
+			cju.Comment,
+		)
+	}
+
+	// -----------------------------
+	// 4. 投稿者のユーザー情報の一括取得
+	// -----------------------------
+	// 投稿者のIDを収集し、重複を考慮したインデックスマップを作成
+	userIDs := make([]interface{}, len(results))
+	userIDToIndices := make(map[int][]int)
+	for i, p := range results {
+		userIDs[i] = p.UserID
+		userIDToIndices[p.UserID] = append(userIDToIndices[p.UserID], i)
+	}
+
+	// ユーザー情報を1回のクエリで取得
+	users := []User{}
+	err = db.Select(&users,
+		"SELECT * FROM users WHERE id IN ("+placeholder+")",
+		userIDs...)
+	if err != nil {
+		return nil, err
+	}
+
+	// 取得したユーザー情報を対応する投稿に設定
+	// 削除フラグがない投稿のみを結果に追加
+	for _, u := range users {
+		if indices, ok := userIDToIndices[u.ID]; ok {
+			for _, idx := range indices {
+				results[idx].User = u
+				if u.DelFlg == 0 {
+					posts = append(posts, results[idx])
+				}
 			}
 		}
+	}
 
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
-		}
-
-		p.Comments = comments
-
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
-		}
-
-		p.CSRFToken = csrfToken
-
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
-		if len(posts) >= postsPerPage {
-			break
-		}
+	// 投稿数が制限を超えた場合は切り詰める
+	if len(posts) > postsPerPage {
+		posts = posts[:postsPerPage]
 	}
 
 	return posts, nil
