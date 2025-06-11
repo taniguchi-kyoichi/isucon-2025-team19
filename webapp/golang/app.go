@@ -51,6 +51,7 @@ type Post struct {
 	Body         string    `db:"body"`
 	Mime         string    `db:"mime"`
 	CreatedAt    time.Time `db:"created_at"`
+	ImagePath    string    `db:"image_path"`
 	CommentCount int
 	Comments     []Comment
 	User         User
@@ -87,6 +88,33 @@ func dbInitialize() {
 
 	for _, sql := range sqls {
 		db.Exec(sql)
+	}
+
+	// Add image_path column if it doesn't exist (ignore errors if already exists)
+	db.Exec("ALTER TABLE `posts` ADD COLUMN `image_path` VARCHAR(255) DEFAULT NULL")
+
+	// Migrate existing image data from BLOB to filesystem
+	var posts []Post
+	err := db.Select(&posts, "SELECT id, mime, imgdata FROM posts WHERE imgdata IS NOT NULL AND (image_path IS NULL OR image_path = '')")
+	if err == nil {
+		for _, post := range posts {
+			if len(post.Imgdata) > 0 {
+				ext := getImageExt(post.Mime)
+				if ext != "" {
+					imagePath := fmt.Sprintf("/images/%d%s", post.ID, ext)
+					fullPath := "./public" + imagePath
+					
+					// Ensure directory exists
+					os.MkdirAll("./public/images", 0755)
+					
+					err := os.WriteFile(fullPath, post.Imgdata, 0644)
+					if err == nil {
+						// Update the database with the image path and clear the blob data
+						db.Exec("UPDATE posts SET image_path = ?, imgdata = NULL WHERE id = ?", imagePath, post.ID)
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -217,26 +245,35 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 	var allCommentsList []Comment
 	if allComments {
 		query = `SELECT * FROM comments WHERE post_id IN (?) ORDER BY post_id, created_at DESC`
+		query, args, err = sqlx.In(query, postIDs)
+		if err != nil {
+			return nil, err
+		}
+		err = db.Select(&allCommentsList, db.Rebind(query), args...)
+		if err != nil {
+			return nil, err
+		}
 	} else {
-		query = `SELECT c.* FROM (
-			SELECT *, ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY created_at DESC) AS rn
-			FROM comments
-			WHERE post_id IN (?)
-		) c WHERE c.rn <= 3 ORDER BY c.post_id, c.created_at DESC`
-	}
-	query, args, err = sqlx.In(query, postIDs)
-	if err != nil {
-		return nil, err
-	}
-	err = db.Select(&allCommentsList, db.Rebind(query), args...)
-	if err != nil {
-		return nil, err
+		// Use simpler query without ROW_NUMBER() for better compatibility
+		query = `SELECT * FROM comments WHERE post_id IN (?) ORDER BY post_id, created_at DESC`
+		query, args, err = sqlx.In(query, postIDs)
+		if err != nil {
+			return nil, err
+		}
+		err = db.Select(&allCommentsList, db.Rebind(query), args...)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Group comments by post_id
 	commentsMap := make(map[int][]Comment)
 	commentUserIDs := make(map[int]bool)
 	for _, comment := range allCommentsList {
+		// Limit to 3 comments per post if not allComments
+		if !allComments && len(commentsMap[comment.PostID]) >= 3 {
+			continue
+		}
 		commentsMap[comment.PostID] = append(commentsMap[comment.PostID], comment)
 		commentUserIDs[comment.UserID] = true
 	}
@@ -308,6 +345,12 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 }
 
 func imageURL(p Post) string {
+	// If we have an image path stored, use it directly
+	if p.ImagePath != "" {
+		return p.ImagePath
+	}
+	
+	// Fallback to old URL pattern for backward compatibility
 	ext := ""
 	if p.Mime == "image/jpeg" {
 		ext = ".jpg"
@@ -318,6 +361,17 @@ func imageURL(p Post) string {
 	}
 
 	return "/image/" + strconv.Itoa(p.ID) + ext
+}
+
+func getImageExt(mime string) string {
+	if mime == "image/jpeg" {
+		return ".jpg"
+	} else if mime == "image/png" {
+		return ".png"
+	} else if mime == "image/gif" {
+		return ".gif"
+	}
+	return ""
 }
 
 func isLogin(u User) bool {
@@ -719,12 +773,12 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
+	// First insert the post to get the ID
+	query := "INSERT INTO `posts` (`user_id`, `mime`, `body`) VALUES (?,?,?)"
 	result, err := db.Exec(
 		query,
 		me.ID,
 		mime,
-		filedata,
 		r.FormValue("body"),
 	)
 	if err != nil {
@@ -735,6 +789,38 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	pid, err := result.LastInsertId()
 	if err != nil {
 		log.Print(err)
+		return
+	}
+
+	// Save image to filesystem
+	ext := getImageExt(mime)
+	imagePath := fmt.Sprintf("/images/%d%s", pid, ext)
+	fullPath := "./public" + imagePath
+	
+	err = os.WriteFile(fullPath, filedata, 0644)
+	if err != nil {
+		log.Print(err)
+		// Rollback the post insertion if image save fails
+		db.Exec("DELETE FROM `posts` WHERE `id` = ?", pid)
+		session := getSession(r)
+		session.Values["notice"] = "画像の保存に失敗しました"
+		session.Save(r, w)
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+
+	// Update the post with the image path
+	_, err = db.Exec("UPDATE `posts` SET `image_path` = ? WHERE `id` = ?", imagePath, pid)
+	if err != nil {
+		log.Print(err)
+		// Clean up the saved image file
+		os.Remove(fullPath)
+		// Rollback the post insertion
+		db.Exec("DELETE FROM `posts` WHERE `id` = ?", pid)
+		session := getSession(r)
+		session.Values["notice"] = "画像パスの更新に失敗しました"
+		session.Save(r, w)
+		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
 
@@ -753,19 +839,42 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 	err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
 	ext := r.PathValue("ext")
 
-	if ext == "jpg" && post.Mime == "image/jpeg" ||
-		ext == "png" && post.Mime == "image/png" ||
-		ext == "gif" && post.Mime == "image/gif" {
-		w.Header().Set("Content-Type", post.Mime)
-		_, err := w.Write(post.Imgdata)
+	// Check if the requested extension matches the MIME type
+	if !((ext == "jpg" && post.Mime == "image/jpeg") ||
+		(ext == "png" && post.Mime == "image/png") ||
+		(ext == "gif" && post.Mime == "image/gif")) {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", post.Mime)
+
+	// Try to serve from filesystem first (new method)
+	if post.ImagePath != "" {
+		fullPath := "./public" + post.ImagePath
+		imageData, err := os.ReadFile(fullPath)
+		if err == nil {
+			_, err = w.Write(imageData)
+			if err != nil {
+				log.Print(err)
+			}
+			return
+		}
+		// If file read fails, fall back to DB method
+		log.Printf("Failed to read image file %s: %v", fullPath, err)
+	}
+
+	// Fallback to DB method (for backward compatibility)
+	if len(post.Imgdata) > 0 {
+		_, err = w.Write(post.Imgdata)
 		if err != nil {
 			log.Print(err)
-			return
 		}
 		return
 	}
