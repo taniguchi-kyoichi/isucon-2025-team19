@@ -172,48 +172,133 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
+	if len(results) == 0 {
+		return []Post{}, nil
+	}
+
 	var posts []Post
 
+	// Collect all post IDs and user IDs
+	postIDs := make([]int, 0, len(results))
+	userIDs := make([]int, 0, len(results))
+	userIDSet := make(map[int]bool)
+
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
-			return nil, err
+		postIDs = append(postIDs, p.ID)
+		if !userIDSet[p.UserID] {
+			userIDs = append(userIDs, p.UserID)
+			userIDSet[p.UserID] = true
+		}
+	}
+
+	// Batch query for comment counts
+	type CommentCount struct {
+		PostID int `db:"post_id"`
+		Count  int `db:"count"`
+	}
+	var commentCounts []CommentCount
+	query := `SELECT post_id, COUNT(*) AS count FROM comments WHERE post_id IN (?) GROUP BY post_id`
+	query, args, err := sqlx.In(query, postIDs)
+	if err != nil {
+		return nil, err
+	}
+	err = db.Select(&commentCounts, db.Rebind(query), args...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create map for quick lookup
+	commentCountMap := make(map[int]int)
+	for _, cc := range commentCounts {
+		commentCountMap[cc.PostID] = cc.Count
+	}
+
+	// Batch query for all comments
+	var allCommentsList []Comment
+	if allComments {
+		query = `SELECT * FROM comments WHERE post_id IN (?) ORDER BY post_id, created_at DESC`
+	} else {
+		query = `SELECT c.* FROM (
+			SELECT *, ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY created_at DESC) AS rn
+			FROM comments
+			WHERE post_id IN (?)
+		) c WHERE c.rn <= 3 ORDER BY c.post_id, c.created_at DESC`
+	}
+	query, args, err = sqlx.In(query, postIDs)
+	if err != nil {
+		return nil, err
+	}
+	err = db.Select(&allCommentsList, db.Rebind(query), args...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Group comments by post_id
+	commentsMap := make(map[int][]Comment)
+	commentUserIDs := make(map[int]bool)
+	for _, comment := range allCommentsList {
+		commentsMap[comment.PostID] = append(commentsMap[comment.PostID], comment)
+		commentUserIDs[comment.UserID] = true
+	}
+
+	// Add comment user IDs to userIDs list
+	for userID := range commentUserIDs {
+		if !userIDSet[userID] {
+			userIDs = append(userIDs, userID)
+			userIDSet[userID] = true
+		}
+	}
+
+	// Batch query for all users
+	var users []User
+	query = `SELECT * FROM users WHERE id IN (?)`
+	query, args, err = sqlx.In(query, userIDs)
+	if err != nil {
+		return nil, err
+	}
+	err = db.Select(&users, db.Rebind(query), args...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create user map for quick lookup
+	userMap := make(map[int]User)
+	for _, user := range users {
+		userMap[user.ID] = user
+	}
+
+	// Build posts with all data
+	for _, p := range results {
+		// Skip if user is deleted
+		user, ok := userMap[p.UserID]
+		if !ok || user.DelFlg != 0 {
+			continue
 		}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
-		}
-
-		p.Comments = comments
-
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
-		}
-
+		p.User = user
+		p.CommentCount = commentCountMap[p.ID]
 		p.CSRFToken = csrfToken
 
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
+		// Get comments for this post
+		if comments, ok := commentsMap[p.ID]; ok {
+			// Assign users to comments
+			for i := range comments {
+				if commentUser, ok := userMap[comments[i].UserID]; ok {
+					comments[i].User = commentUser
+				}
+			}
+
+			// Reverse comments to get chronological order
+			for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+				comments[i], comments[j] = comments[j], comments[i]
+			}
+
+			p.Comments = comments
+		} else {
+			p.Comments = []Comment{}
 		}
+
+		posts = append(posts, p)
 		if len(posts) >= postsPerPage {
 			break
 		}
@@ -386,7 +471,8 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
+	// Limit the initial query to reduce memory usage and improve performance
+	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT 100")
 	if err != nil {
 		log.Print(err)
 		return
@@ -432,7 +518,8 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
+	// Limit posts to improve performance
+	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT 100", user.ID)
 	if err != nil {
 		log.Print(err)
 		return
@@ -444,40 +531,24 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	commentCount := 0
-	err = db.Get(&commentCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID)
+	// Combine queries to reduce database round trips
+	type UserStats struct {
+		PostCount      int `db:"post_count"`
+		CommentCount   int `db:"comment_count"`
+		CommentedCount int `db:"commented_count"`
+	}
+	
+	stats := UserStats{}
+	statsQuery := `
+		SELECT 
+			(SELECT COUNT(*) FROM posts WHERE user_id = ?) AS post_count,
+			(SELECT COUNT(*) FROM comments WHERE user_id = ?) AS comment_count,
+			(SELECT COUNT(*) FROM comments c JOIN posts p ON c.post_id = p.id WHERE p.user_id = ?) AS commented_count
+	`
+	err = db.Get(&stats, statsQuery, user.ID, user.ID, user.ID)
 	if err != nil {
 		log.Print(err)
 		return
-	}
-
-	postIDs := []int{}
-	err = db.Select(&postIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	postCount := len(postIDs)
-
-	commentedCount := 0
-	if postCount > 0 {
-		s := []string{}
-		for range postIDs {
-			s = append(s, "?")
-		}
-		placeholder := strings.Join(s, ", ")
-
-		// convert []int -> []interface{}
-		args := make([]interface{}, len(postIDs))
-		for i, v := range postIDs {
-			args[i] = v
-		}
-
-		err = db.Get(&commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
-		if err != nil {
-			log.Print(err)
-			return
-		}
 	}
 
 	me := getSessionUser(r)
@@ -498,7 +569,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		CommentCount   int
 		CommentedCount int
 		Me             User
-	}{posts, user, postCount, commentCount, commentedCount, me})
+	}{posts, user, stats.PostCount, stats.CommentCount, stats.CommentedCount, me})
 }
 
 func getPosts(w http.ResponseWriter, r *http.Request) {
