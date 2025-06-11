@@ -174,45 +174,128 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	var posts []Post
 
-	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+	if len(results) == 0 {
+		return posts, nil
+	}
+
+	// 投稿IDのリストを作成
+	postIDs := make([]int, len(results))
+	postMap := make(map[int]*Post)
+	for i, p := range results {
+		postIDs[i] = p.ID
+		p.CSRFToken = csrfToken
+		postMap[p.ID] = &results[i]
+	}
+
+	// ユーザー情報を一括取得
+	userIDs := make([]int, len(results))
+	for i, p := range results {
+		userIDs[i] = p.UserID
+	}
+	userMap := make(map[int]User)
+	if len(userIDs) > 0 {
+		placeholder := strings.Repeat("?,", len(userIDs)-1) + "?"
+		args := make([]interface{}, len(userIDs))
+		for i, id := range userIDs {
+			args[i] = id
+		}
+		var users []User
+		err := db.Select(&users, "SELECT * FROM `users` WHERE `id` IN ("+placeholder+")", args...)
 		if err != nil {
 			return nil, err
 		}
-
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
+		for _, u := range users {
+			userMap[u.ID] = u
 		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
+	}
+
+	// コメント数を一括取得
+	if len(postIDs) > 0 {
+		placeholder := strings.Repeat("?,", len(postIDs)-1) + "?"
+		args := make([]interface{}, len(postIDs))
+		for i, id := range postIDs {
+			args[i] = id
+		}
+		type CommentCount struct {
+			PostID int `db:"post_id"`
+			Count  int `db:"count"`
+		}
+		var counts []CommentCount
+		err := db.Select(&counts, "SELECT post_id, COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+") GROUP BY post_id", args...)
 		if err != nil {
 			return nil, err
 		}
+		for _, c := range counts {
+			if p, ok := postMap[c.PostID]; ok {
+				p.CommentCount = c.Count
+			}
+		}
+	}
 
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
+	// コメントとコメントユーザーを一括取得
+	if len(postIDs) > 0 {
+		placeholder := strings.Repeat("?,", len(postIDs)-1) + "?"
+		args := make([]interface{}, len(postIDs))
+		for i, id := range postIDs {
+			args[i] = id
+		}
+
+		query := `
+			SELECT c.*, u.id AS 'user.id', u.account_name AS 'user.account_name', 
+			       u.passhash AS 'user.passhash', u.authority AS 'user.authority', 
+			       u.del_flg AS 'user.del_flg', u.created_at AS 'user.created_at'
+			FROM comments c
+			INNER JOIN users u ON c.user_id = u.id
+			WHERE c.post_id IN (` + placeholder + `)
+			ORDER BY c.post_id, c.created_at DESC
+		`
+
+		rows, err := db.Query(query, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+
+		commentsMap := make(map[int][]Comment)
+		for rows.Next() {
+			var c Comment
+			var u User
+			err := rows.Scan(&c.ID, &c.PostID, &c.UserID, &c.Comment, &c.CreatedAt,
+				&u.ID, &u.AccountName, &u.Passhash, &u.Authority, &u.DelFlg, &u.CreatedAt)
 			if err != nil {
 				return nil, err
 			}
+			c.User = u
+			commentsMap[c.PostID] = append(commentsMap[c.PostID], c)
 		}
 
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
+		// コメントを各投稿に設定
+		for postID, comments := range commentsMap {
+			if p, ok := postMap[postID]; ok {
+				if allComments {
+					p.Comments = comments
+				} else {
+					if len(comments) > 3 {
+						p.Comments = comments[:3]
+					} else {
+						p.Comments = comments
+					}
+				}
+				// reverse
+				for i, j := 0, len(p.Comments)-1; i < j; i, j = i+1, j-1 {
+					p.Comments[i], p.Comments[j] = p.Comments[j], p.Comments[i]
+				}
+			}
 		}
+	}
 
-		p.Comments = comments
-
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
-		}
-
-		p.CSRFToken = csrfToken
-
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
+	// 投稿を構築
+	for _, p := range results {
+		if user, ok := userMap[p.UserID]; ok {
+			p.User = user
+			if p.User.DelFlg == 0 {
+				posts = append(posts, p)
+			}
 		}
 		if len(posts) >= postsPerPage {
 			break
