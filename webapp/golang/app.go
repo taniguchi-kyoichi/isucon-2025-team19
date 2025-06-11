@@ -11,9 +11,11 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
@@ -27,6 +29,10 @@ import (
 var (
 	db    *sqlx.DB
 	store *gsm.MemcacheStore
+
+	// Static file cache
+	staticCache      = make(map[string][]byte)
+	staticCacheMutex sync.RWMutex
 )
 
 const (
@@ -172,48 +178,139 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	var posts []Post
+	if len(results) == 0 {
+		return []Post{}, nil
+	}
 
-	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+	// 投稿IDのリストを作成
+	postIDs := make([]int, len(results))
+	userIDs := make(map[int]bool)
+	for i, p := range results {
+		postIDs[i] = p.ID
+		userIDs[p.UserID] = true
+	}
+
+	// ユーザー情報を一括取得
+	userIDList := make([]int, 0, len(userIDs))
+	for userID := range userIDs {
+		userIDList = append(userIDList, userID)
+	}
+
+	userMap := make(map[int]User)
+	if len(userIDList) > 0 {
+		users := []User{}
+		query, args, err := sqlx.In("SELECT * FROM `users` WHERE `id` IN (?)", userIDList)
+		if err != nil {
+			return nil, err
+		}
+		query = db.Rebind(query)
+		err = db.Select(&users, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		for _, user := range users {
+			userMap[user.ID] = user
+		}
+	}
+
+	// コメント数を一括取得
+	commentCountMap := make(map[int]int)
+	if len(postIDs) > 0 {
+		type CommentCount struct {
+			PostID int `db:"post_id"`
+			Count  int `db:"count"`
+		}
+		commentCounts := []CommentCount{}
+		query, args, err := sqlx.In("SELECT post_id, COUNT(*) AS count FROM `comments` WHERE `post_id` IN (?) GROUP BY post_id", postIDs)
+		if err != nil {
+			return nil, err
+		}
+		query = db.Rebind(query)
+		err = db.Select(&commentCounts, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		for _, cc := range commentCounts {
+			commentCountMap[cc.PostID] = cc.Count
+		}
+	}
+
+	// コメントを一括取得
+	commentsMap := make(map[int][]Comment)
+	if len(postIDs) > 0 {
+		type CommentWithUser struct {
+			Comment
+			UserAccountName string    `db:"user_account_name"`
+			UserPasshash    string    `db:"user_passhash"`
+			UserAuthority   int       `db:"user_authority"`
+			UserDelFlg      int       `db:"user_del_flg"`
+			UserCreatedAt   time.Time `db:"user_created_at"`
+		}
+
+		comments := []CommentWithUser{}
+		query, args, err := sqlx.In(`
+			SELECT c.*, 
+			       u.account_name as user_account_name, 
+			       u.passhash as user_passhash, 
+			       u.authority as user_authority, 
+			       u.del_flg as user_del_flg, 
+			       u.created_at as user_created_at
+			FROM comments c 
+			INNER JOIN users u ON c.user_id = u.id 
+			WHERE c.post_id IN (?)
+			ORDER BY c.post_id, c.created_at DESC`, postIDs)
+		if err != nil {
+			return nil, err
+		}
+		query = db.Rebind(query)
+		err = db.Select(&comments, query, args...)
 		if err != nil {
 			return nil, err
 		}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
-		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		for i := 0; i < len(comments); i++ {
-			err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
+		// コメントをpost_id別にグループ化
+		for _, c := range comments {
+			c.Comment.User = User{
+				ID:          c.UserID,
+				AccountName: c.UserAccountName,
+				Passhash:    c.UserPasshash,
+				Authority:   c.UserAuthority,
+				DelFlg:      c.UserDelFlg,
+				CreatedAt:   c.UserCreatedAt,
 			}
+
+			// コメント数制限を適用（allCommentsがfalseの場合は3件まで）
+			if !allComments && len(commentsMap[c.PostID]) >= 3 {
+				continue
+			}
+
+			commentsMap[c.PostID] = append(commentsMap[c.PostID], c.Comment)
 		}
 
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
+		// コメントを逆順にする（最新順から古い順へ）
+		for postID := range commentsMap {
+			comments := commentsMap[postID]
+			for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+				comments[i], comments[j] = comments[j], comments[i]
+			}
+			commentsMap[postID] = comments
+		}
+	}
+
+	// 結果をアセンブル
+	var posts []Post
+	for _, p := range results {
+		user, exists := userMap[p.UserID]
+		if !exists || user.DelFlg != 0 {
+			continue
 		}
 
-		p.Comments = comments
-
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
-		}
-
+		p.User = user
+		p.CommentCount = commentCountMap[p.ID]
+		p.Comments = commentsMap[p.ID]
 		p.CSRFToken = csrfToken
 
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
+		posts = append(posts, p)
 		if len(posts) >= postsPerPage {
 			break
 		}
@@ -789,6 +886,76 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
+}
+
+// Initialize static file cache
+func initStaticCache() error {
+	staticPaths := []string{
+		"../public/css",
+		"../public/js",
+		"../public/img",
+	}
+
+	for _, dir := range staticPaths {
+		err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					return err
+				}
+				relativePath := strings.TrimPrefix(path, "../public")
+				staticCacheMutex.Lock()
+				staticCache[relativePath] = data
+				staticCacheMutex.Unlock()
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func serveStaticFile(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+
+	// Try to serve from cache first
+	staticCacheMutex.RLock()
+	data, exists := staticCache[path]
+	staticCacheMutex.RUnlock()
+
+	if exists {
+		// Set cache headers
+		w.Header().Set("Cache-Control", "public, max-age=2592000") // 30 days
+		w.Header().Set("Expires", time.Now().Add(30*24*time.Hour).Format(http.TimeFormat))
+
+		// Determine content type
+		ext := filepath.Ext(path)
+		switch ext {
+		case ".css":
+			w.Header().Set("Content-Type", "text/css")
+		case ".js":
+			w.Header().Set("Content-Type", "application/javascript")
+		case ".jpg", ".jpeg":
+			w.Header().Set("Content-Type", "image/jpeg")
+		case ".png":
+			w.Header().Set("Content-Type", "image/png")
+		case ".gif":
+			w.Header().Set("Content-Type", "image/gif")
+		case ".ico":
+			w.Header().Set("Content-Type", "image/x-icon")
+		}
+
+		w.Write(data)
+		return
+	}
+
+	// Fallback to standard file server
+	http.FileServer(http.Dir("../public")).ServeHTTP(w, r)
 }
 
 func main() {
